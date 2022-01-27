@@ -8,44 +8,185 @@
  * Released under the MIT license
  *
  */
-BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
-    var banner = [
-        '  ____ ___ _____ ',
-        ' / ___|_ _|_   _| __      __   _      _____              _           _',
-        '| |  _ | |  | |   \\ \\    / /__| |__  |_   _|__ _ _ _ __ (_)_ _  __ _| |',
-        '| |_| || |  | |    \\ \\/\\/ / -_) \'_ \\   | |/ -_) \'_| \'  \\| | \' \\/ _` | |',
-        ' \\____|___| |_|     \\_/\\_/\\___|_.__/   |_|\\___|_| |_|_|_|_|_||_\\__,_|_|'
-    ];
-    function greetings() {
-        var title = this.cols() > banner[1].length ? banner.join('\n') : 'GIT Web Terminal';
-        return title + '\n\n' + 'use [[;#fff;]help] to see the available commands' +
-               ' or [[;#fff;]credits] to list the projects used\n';
+/* global fs, git, BrowserFS, zip, location, $, Worker, localStorage, EventEmitter, path, vi */
+var term = {
+    completion: {}
+};
+
+// restore the Array::find overwriten by dynarch from Ymacs - make it double purpose
+Array.prototype.find = function (value) {
+    if (typeof value === 'function') {
+        // original
+        let i = 0;
+        for (let item of this) {
+            if (value(item, i++)) {
+                return item;
+            }
+        }
+    } else {
+        var t = value;
+        for (var e = this.length; --e >= 0;)if (this[e] === t) return e; return -1;
     }
+};
+term.banner = [
+    '  ____ ___ _____ ',
+    ' / ___|_ _|_   _| __      __   _      _____              _           _',
+    '| |  _ | |  | |   \\ \\    / /__| |__  |_   _|__ _ _ _ __ (_)_ _  __ _| |',
+    '| |_| || |  | |    \\ \\/\\/ / -_) \'_ \\   | |/ -_) \'_| \'  \\| | \' \\/ _` | |',
+    ' \\____|___| |_|     \\_/\\_/\\___|_.__/   |_|\\___|_| |_|_|_|_|_||_\\__,_|_|'
+];
+function greetings() {
+    var title;
+    if (this.cols() > term.banner[1].length) {
+        title = term.banner.join('\n');
+    } else {
+        title = 'GIT Web Terminal';
+    }
+    return title + '\n\n' + 'use [[;#fff;]help] to see the available commands' +
+        ' or [[;#fff;]credits] to list the projects used\n';
+}
+function BrowserFSConfigure() {
+    return new Promise(function (resolve, reject) {
+        BrowserFS.configure({
+            fs: 'IndexedDB',
+            options: {}
+        }, function (err) {
+            if (err) {
+                var term = $.terminal.active();
+                if (!term) {
+                    term = $('.term').terminal(function (command, term) {
+                        term.error('BrowserFS was not initialized');
+                    }, { greetings: false, name: 'git' }).echo(greetings);
+                }
+                term.error(err.message || err);
+                reject(err.message || err);
+            } else {
+                resolve();
+            }
+        });
+    });
+}
+
+BrowserFSConfigure().then(() => {
     var name = 'git'; // terminal name for history
-    if (err) {
-        return $('.term').terminal(function(command, term) {
-            term.error('BrowserFS was not initialized');
-        }, {greetings: false, name}).echo(greetings).error(err.message || err);
-    }
     window.fs = BrowserFS.BFSRequire('fs');
     window.path = BrowserFS.BFSRequire('path');
+    window.buffer = BrowserFS.BFSRequire('buffer');
+    git.plugins.set('fs', window.fs);
+    if (typeof zip !== 'undefined') {
+        zip.workerScriptsPath = location.pathname.replace(/\/[^\/]+$/, '/') + 'js/zip/';
+    }
+    var scope = location.pathname.replace(/\/[^\/]+$/, '/');
+
+    $.fn.confirm = async function (message) {
+        var term = $(this).terminal();
+        const response = await new Promise(function (resolve) {
+            term.push(function (command) {
+                if (command.match(/Y(es)?/i)) {
+                    resolve(true);
+                } else if (command.match(/N(o)?/i)) {
+                    resolve(false);
+                }
+            }, {
+                prompt: message
+            });
+        });
+        term.pop();
+        return response;
+    };
     if ('serviceWorker' in navigator) {
-        var scope = location.pathname.replace(/\/[^\/]+$/, '/');
+        // loading this repo from browerFS will not work because serviceWorker can't be loaded from
+        // service worker.
         if (!scope.match(/__browserfs__/)) {
-            navigator.serviceWorker.register('sw.js', {scope})
-                     .then(function(reg) {
-                         reg.addEventListener('updatefound', function() {
-                             var installingWorker = reg.installing;
-                             console.log('A new service worker is being installed:',
-                                         installingWorker);
-                         });
-                         // registration worked
-                         console.log('Registration succeeded. Scope is ' + reg.scope);
-                     }).catch(function(error) {
-                         // registration failed
-                             console.log('Registration failed with ' + error);
-                     });
+            navigator.serviceWorker.register('sw.js', { scope })
+                .then(function (reg) {
+                    reg.addEventListener('updatefound', function () {
+                        var installingWorker = reg.installing;
+                        console.log('A new service worker is being installed:',
+                            installingWorker);
+                    });
+                    // registration worked
+                    console.log('Registration succeeded. Scope is ' + reg.scope);
+                }).catch(function (error) {
+                    // registration failed
+                    console.log('Registration failed with ' + error);
+                });
         }
+    }
+    var git_wrapper = term.git = {};
+    if (typeof Worker !== 'undefined') {
+        var worker = new Worker(scope + 'js/git-worker.js');
+        let count = 0;
+        worker.addEventListener("message", function handler({ data }) {
+            function response(id, method, result) {
+                worker.postMessage({ type: "RPC", method, object: data.object, id, result });
+            }
+            if (data.type === 'RPC') {
+                var object;
+                if (data.object === 'terminal') {
+                    object = instance;
+                } else if (data.object === 'localStorage') {
+                    object = localStorage;
+                }
+                if (object) {
+                    if (typeof object[data.method] === 'function') {
+                        var result = object[data.method].apply(object, data.args || []);
+                        if (result !== object) {
+                            if (result && typeof result.then === 'function') {
+                                result.then(function (result) {
+                                    response(data.id, data.method, result);
+                                });
+                            } else {
+                                response(data.id, data.method, result);
+                            }
+                        } else {
+                            response(data.id, data.method);
+                        }
+                    }
+                }
+            }
+        });
+        Object.getOwnPropertyNames(git).forEach(function (name) {
+            var emitter_handler = null;
+            if (typeof git[name] === 'function') {
+                git_wrapper[name] = function ({ emitter, fs, ...args }) {
+                    return new Promise(function (resolve, reject) {
+                        var id = `rpc${++count}`;
+                        if (emitter instanceof EventEmitter) {
+                            emitter_handler = function handler({ data }) {
+                                if (data.type === 'EMITTER' && id === data.id) {
+                                    emitter.trigger('message', [data.message]);
+                                }
+                            };
+                            args.emitter = true;
+                            worker.addEventListener("message", emitter_handler);
+                        }
+                        worker.addEventListener("message", function handler({ data }) {
+                            if (data.type === 'RPC' && id === data.id) {
+                                if (emitter_handler) {
+                                    worker.removeEventListener("message", emitter_handler);
+                                }
+                                // Sync BrowserFS
+                                BrowserFSConfigure().then(() => {
+                                    window.fs = BrowserFS.BFSRequire('fs');
+                                    if (data.error) {
+                                        reject(data.error);
+                                    } else {
+                                        resolve(data.result);
+                                    }
+                                });
+                                worker.removeEventListener("message", handler);
+                            }
+                        });
+                        worker.postMessage({ type: "RPC", method: name, id, params: args });
+                    });
+                };
+            }
+        });
+    } else {
+        Object.getOwnPropertyNames(git).forEach(function (name) {
+            git_wrapper[name] = git[name].bind(git);
+        });
     }
     var dir = '/';
     var cwd = '/';
@@ -58,15 +199,21 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
     });
     var branch;
     // -----------------------------------------------------------------------------------------------------
+    // :: resolve path
+    // -----------------------------------------------------------------------------------------------------
+    function resolve(p) {
+        return path.resolve(p[0] == '/' ? p : path.join(cwd, p));
+    }
+    // -----------------------------------------------------------------------------------------------------
     function color(name, string) {
         var colors = {
-            blue:   '#55f',
-            green:  '#4d4',
-            grey:   '#999',
-            red:    '#A00',
+            blue: '#55f',
+            green: '#4d4',
+            grey: '#999',
+            red: '#A00',
             yellow: '#FF5',
             violet: '#a320ce',
-            white:  '#fff',
+            white: '#fff',
             'persian-green': '#0aa'
         };
         if (colors[name]) {
@@ -78,8 +225,20 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
     // -----------------------------------------------------------------------------------------------------
     function messageEmitter() {
         var emitter = new EventEmitter();
+        var first = {};
+        var re = /^([^:]+):\s+[0-9]+%?/;
         emitter.on('message', (message) => {
-            term.echo(message);
+            var m = message.match(re);
+            if (m) {
+                if (typeof first[m[1]] == 'undefined') {
+                    term.echo(message);
+                    first[m[1]] = term.last_index();
+                } else {
+                    term.update(first[m[1]], message);
+                }
+            } else {
+                term.echo(message);
+            }
         });
         return emitter;
     }
@@ -97,8 +256,8 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
             path = path.slice(1);
         }
         var parts = string === '/'
-        ? string.split('/')
-        : string.replace(/\/?[^\/]*$/, '').split('/');
+            ? string.split('/')
+            : string.replace(/\/?[^\/]*$/, '').split('/');
         if (parts[0] === '') {
             parts = parts.slice(1);
         }
@@ -116,7 +275,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
     function read(cmd, cb, raw) {
         var filename = typeof cmd === 'string' ? cmd : cmd.args.length == 1 ? cwd + '/' + cmd.args[0] : null;
         if (filename) {
-            fs.readFile(filename, function(err, data) {
+            fs.readFile(filename, function (err, data) {
                 if (err) {
                     term.error(err.message);
                 } else {
@@ -126,9 +285,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         var language = m[1];
                     }
                     if (!raw && language && Prism.languages[language]) {
-                        var grammar = Prism.languages[language];
-                        var tokens = Prism.tokenize(file, grammar);
-                        text = Prism.Token.stringify(tokens, language);
+                        text = $.terminal.prism(language, text);
                     }
                     cb(text);
                 }
@@ -167,16 +324,16 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
         return option === true ? false : option;
     }
     // -----------------------------------------------------------------------------------------------------
-    function getAllStats({fs, cwd, branch}) {
+    function getAllStats({ cwd, branch }) {
         function notGitDir(name) {
             return !name.match(/^\.git\/?/);
         }
         return gitroot(cwd).then((dir) => {
-            return Promise.all([listBranchFiles({fs, dir, branch}), listDir(dir)]).then(([tracked, rest]) => {
+            var all = listAllFiles({ dir, pattern: /^(?!.git\/)[^\/]+\// });
+            return Promise.all([listBranchFiles({ dir, branch }), all]).then(([tracked, files]) => {
                 var re = new RegExp('^' + dir);
-                rest = rest.files.map(path => path.replace(re, ''));
-                return Promise.all(union(tracked, rest).filter(notGitDir).map(filepath => {
-                    return git.status({fs, dir, filepath}).then(status => {
+                return Promise.all(union(tracked, files).map(filepath => {
+                    return git.status({ dir, filepath }).then(status => {
                         return [filepath, status];
                     });
                 }));
@@ -184,20 +341,41 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
         });
     }
     // -----------------------------------------------------------------------------------------------------
-    function gitAddAll({fs, dir, branch, all}) {
-        return getAllStats({fs, cwd: dir, branch}).then((files) => {
+    function gitAddAll({ dir, branch, all }) {
+        return getAllStats({ cwd: dir, branch }).then((files) => {
             var skip_status = ['unmodified', 'ignored', 'modified', 'deleted', 'added', 'absent'];
             if (!all) {
                 skip_status.push('*added');
             }
             return files.filter(([_, status]) => !skip_status.includes(status));
         }).then((files) => {
-            return Promise.all(files.map(([filepath, status]) => git.add({fs, dir, filepath})));
+            return Promise.all(files.map(([filepath, status]) => git.add({ dir, filepath })));
         });
     }
     const error = (e) => term.error(e.message || e).resume();
-    var commands = {
-        cd: function(cmd) {
+    term.commands = {
+        mkdir: function (cmd) {
+            if (cmd.args.length > 0) {
+                var options = [];
+                var args = [];
+                cmd.args.forEach((arg) => {
+                    var m = arg.match(/^-([^\-].*)/);
+                    if (m) {
+                        options = options.concat(m[1].split(''));
+                    } else {
+                        args.push(arg);
+                    }
+                });
+                if (args.length) {
+                    term.pause();
+                    Promise.all(args.map(dir => {
+                        dir = dir[0] === '/' ? dir : path.join(cwd, dir);
+                        return mkdir(dir, options.includes('p'))
+                    })).then(term.resume).catch(error);
+                }
+            }
+        },
+        cd: function (cmd) {
             if (cmd.args.length === 1) {
                 var dirname = path.resolve(cwd + '/' + cmd.args[0]);
                 term.pause();
@@ -208,7 +386,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         term.error(`"${dirname}" is not a directory`).resume();
                     } else {
                         cwd = dirname == '/' ? dirname : dirname.replace(/\/$/, '');
-                        gitBranch({fs, cwd}).then(b => {
+                        gitBranch({ cwd }).then(b => {
                             branch = b;
                             term.resume();
                         });
@@ -216,41 +394,35 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 });
             }
         },
-        emacs: function(cmd) {
-            if (ymacs_loading) {
-                term.echo('Loading Emacs (it take few seconds, but only first time)...').pause();
+        emacs: function (cmd) {
+            term.resume();
+            var fname = cmd.args[0];
+            if (typeof fname !== 'string') {
+                fname = String(fname);
             }
-            ymacs_promise.then(ymacs => {
-                term.resume();
-                var fname = cmd.args[0];
-                if (typeof fname !== 'string') {
-                    fname = String(fname);
-                }
-                function init() {
-                    setTimeout(function() {
-                        term.focus(false);
-                        $('.DlDesktop').show();
-                        desktop.fullScreen();
-                        ymacs.focus();
-                        ymacs.disabled(false);
-                        desktop.callHooks('onResize');
-                    }, 0);
-                }
-                if (fname) {
-                    var path;
-                    if (fname.match(/^\//)) {
-                        path = fname;
-                    } else {
-                        path = (cwd === '/' ? '' : cwd) + '/' + fname;
-                    }
-                    init();
-                    ymacs.getActiveBuffer().cmd('find_file', path);
+            function init() {
+                setTimeout(function () {
+                    term.focus(false);
+                    $('.Ymacs, .DlLayout').show();
+                    ymacs.focus();
+                    ymacs.disabled(false);
+                    ymacs.callHooks('onResize');
+                }, 0);
+            }
+            if (fname) {
+                var path;
+                if (fname.match(/^\//)) {
+                    path = fname;
                 } else {
-                    init();
+                    path = (cwd === '/' ? '' : cwd) + '/' + fname;
                 }
-            });
+                init();
+                ymacs.getActiveBuffer().cmd('find_file', path);
+            } else {
+                init();
+            }
         },
-        vi: function(cmd) {
+        vi: function (cmd) {
             var textarea = $('.vi');
             var editor;
             var fname = cmd.args[0];
@@ -263,18 +435,17 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 if (fname.match(/^\//)) {
                     path = fname;
                 } else {
-                    path = (cwd === '/' ? '' : cmd) + '/' + fname;
+                    path = (cwd === '/' ? '' : cwd) + '/' + fname;
                 }
                 function open(file) {
-                    // we need to replace < and & because jsvi is handling html tags
-                    // and don't work properly for raw text
-                    textarea.val(file.replace(/</g, '&lt;').replace(/&/g, '&amp;'));
+                    textarea.val(file);
                     editor = window.editor = vi(textarea[0], {
                         color: '#ccc',
                         backgroundColor: '#000',
-                        onSave: function() {
+                        onSave: function () {
+                            // we need to replace < and & because jsvi is converting them to entities
                             var file = textarea.val().replace(/&amp;/g, '&').replace(/&lt;/g, '<');
-                            fs.writeFile(path, file, function(err, wr) {
+                            fs.writeFile(path, file, function (err, wr) {
                                 if (err) {
                                     term.error(err.message);
                                 }
@@ -301,14 +472,14 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 });
             }
         },
-        cat: function(cmd) {
+        cat: function (cmd) {
             read(cmd, term.echo);
         },
-        less: function(cmd) {
+        less: function (cmd) {
             read(cmd, term.less.bind(term));
         },
-        ls: function(cmd) {
-            var {options, args} = split_args(cmd.args);
+        ls: function (cmd) {
+            var { options, args } = split_args(cmd.args);
             function filter(list) {
                 if (options.match(/a/)) {
                     return list;
@@ -320,11 +491,14 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
             }
             list(cwd + '/' + (args[0] || '')).then((content) => {
                 var dirs = filter(['.', '..'].concat(content.dirs)).map((dir) => color('blue', dir));
-                term.echo(dirs.concat(filter(content.files)).join('\n'));
+                var result = dirs.concat(filter(content.files));
+                if (result.length) {
+                    term.echo(result);
+                }
             });
         },
-        clean: function() {
-            term.push(function(yesno) {
+        clean: function () {
+            term.push(function (yesno) {
                 if (yesno.match(/^y(es)?$/i)) {
                     fs.getRootFS().empty();
                 }
@@ -335,8 +509,8 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 prompt: 'are you sure you want clean File System [Y/N]? '
             });
         },
-        rm: function(cmd) {
-            var {options, args} = split_args(cmd.args);
+        rm: function (cmd) {
+            var { options, args } = split_args(cmd.args);
 
             var len = args.length;
             if (len) {
@@ -346,27 +520,46 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 var path_name = path.resolve(cwd + '/' + arg);
                 fs.stat(path_name, async (err, stat) => {
                     if (err) {
-                        term.error(err);
+                        error(err);
                     } else if (stat) {
-                        if (stat.isDirectory()) {
-                            if (options.match(/r/)) {
-                                await rmdir(path_name);
+                        try {
+                            if (stat.isDirectory()) {
+                                if (options.match(/r/)) {
+                                    await rmdir(path_name);
+                                } else {
+                                    term.error(`${path_name} is directory`);
+                                }
+                            } else if (stat.isFile()) {
+                                await new Promise((resolve) => fs.unlink(path_name, resolve));
                             } else {
-                                term.error(`${path_name} is directory`);
+                                term.error(`${path_name} is invalid`);
                             }
-                        } else if (stat.isFile()) {
-                            await new Promise((resolve) => fs.unlink(path_name, resolve));
-                        } else {
-                            term.error(`${path_name} is invalid`);
-                        }
-                        if (!--len) {
-                            term.resume();
+                            if (!--len) {
+                                term.resume();
+                            }
+                        } catch (e) {
+                            error(e);
                         }
                     }
                 });
             });
         },
-        record: function(cmd) {
+        zip: function (cmd) {
+            term.pause();
+            if (cmd.args.length === 2) {
+                makeZip.apply(null, cmd.args.map(resolve)).then(() => {
+                    term.echo(`click to download [[!;;;;__browserfs__/${cmd.args[1]}]${cmd.args[1]}]`).resume();
+                }).catch(error);
+            } else {
+                term.echo('compress directory\nzip <DIRECTORY> <ZIP FILENAME>');
+            }
+        },
+        view: function (cmd) {
+            if (cmd.args.length === 1) {
+                view(cmd.args[0]);
+            }
+        },
+        record: function (cmd) {
             if (cmd.args[0] == 'start') {
                 term.history_state(true);
             } else if (cmd.args[0] == 'stop') {
@@ -376,7 +569,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
             }
         },
         git: {
-            reset: async function(cmd) {
+            reset: async function (cmd) {
                 cmd.args.shift();
                 term.pause();
                 const hard = cmd.args.includes('--hard');
@@ -384,60 +577,57 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     var dir = await gitroot(cwd);
                     const ref = cmd.args.filter(arg => arg.match(/^HEAD/))[0];
                     if (ref) {
-                        await gitReset({fs, dir, hard, ref, branch});
-                        const commits = await git.log({fs, dir, depth: 1});
+                        await gitReset({ dir, git: git_wrapper, hard, ref, branch });
+                        const commits = await git.log({ dir, depth: 1 });
                         const commit = commits.pop();
-                        const head = await git.resolveRef({fs, dir, ref: 'HEAD'});
+                        const head = await git.resolveRef({ dir, ref: 'HEAD' });
                         term.echo(`HEAD is now at ${commit.oid.substring(0, 7)} ${commit.message.trim()}`);
+                    } else {
+                        const matrix = await git.statusMatrix({ fs, dir });
+                        const files = matrix.filter(file => [0, 3].includes(file[3]));
+                        files.forEach(([filepath]) => {
+                            git.resetIndex({ fs, dir: '/gaiman', filepath });
+                        });
                     }
-                } catch(e) {
+                } catch (e) {
                     term.exception(e);
                 } finally {
                     term.resume();
                 }
             },
-            branch: function(cmd) {
-                term.echo('to be implemented');
+            branch: async function (cmd) {
+                let dir = await gitroot(cwd);
+                let remoteBranches = await git.listBranches({ fs, dir })
+                term.echo(remoteBranches);
             },
-            pull: async function(cmd) {
+            test: async function (cmd) {
+                try {
+
+                } catch (e) {
+                    term.exception(e);
+                } finally {
+                    term.resume();
+                }
+            },
+            pull: async function (cmd) {
                 try {
                     term.pause();
                     var dir = await gitroot(cwd);
                     var remote = 'origin';
-                    var HEAD_before = await git.resolveRef({fs, dir, ref: 'HEAD'});
-                    var url = await repoURL({fs, dir});
+                    var HEAD_before = await git.resolveRef({ dir, ref: 'HEAD' });
+                    var url = await repoURL({ dir });
                     var output = [];
                     var auth = {};
                     if (credentials.password && credentials.username) {
                         auth.authUsername = credentials.username;
                         auth.authPassword = credentials.password;
                     }
-                    function messageEmitter() {
-                        var emitter = new EventEmitter();
-                        var first;
-                        emitter.on('message', (message) => {
-                            console.log(message);
-                            if (message.match(/^Compressing/)) {
-                                if (typeof first === 'undefined') {
-                                    term.echo(message);
-                                    first = term.last_index();
-                                } else {
-                                    term.update(first, message);
-                                }
-                            } else {
-                                term.echo(message);
-                            }
-                        });
-                        return emitter;
-                    }
                     var ref = await git.resolveRef({
-                        fs,
                         dir,
                         ref: 'HEAD',
                         depth: 1
                     });
-                    await git.pull({
-                        fs,
+                    await git_wrapper.pull({
                         dir,
                         singleBranch: true,
                         fastForwardOnly: true,
@@ -446,17 +636,14 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     });
                     // isomorphic git patch
                     const head = await git.resolveRef({
-                        fs,
                         dir,
                         ref: 'HEAD',
                         depth: 1
                     });
-                    console.log({head, ref});
                     if (head != ref) {
                         await new Promise((resolve) => fs.writeFile(`${dir}/.git/HEAD`, ref, resolve));
                     }
-                    var HEAD_after = await git.resolveRef({fs, dir, ref: 'HEAD'});
-                    console.log(JSON.stringify({HEAD_after, HEAD_before}));
+                    var HEAD_after = await git.resolveRef({ dir, ref: 'HEAD' });
                     if (HEAD_after === HEAD_before) {
                         term.echo('Already up-to-date.');
                     } else {
@@ -474,11 +661,11 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                             branch
                         ].join(''));
                         output.push('Fast-froward');
-                        const diffs = await gitCommitDiff({fs, dir, oldSha: HEAD_before, newSha: HEAD_after});
+                        const diffs = await gitCommitDiff({ dir, oldSha: HEAD_before, newSha: HEAD_after });
                         output.push(diffStat(Object.values(diffs).map(val => val.diff)));
                         term.echo(output.join('\n'));
                     }
-                } catch(e) {
+                } catch (e) {
                     term.exception(e);
                 } finally {
                     term.resume();
@@ -497,8 +684,60 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                  *  1 file changed, 1 insertion(+)
                  */
             },
-            checkout: function(cmd) {
-                term.echo('to be implemented');
+            fetch: async function (cmd) {
+                cmd.args.shift();
+                try {
+                    if (cmd.args.length) {
+                        term.pause();
+                        var dir = await gitroot(cwd);
+                        var emitter = messageEmitter();
+                        await git_wrapper.fetch({
+                            dir,
+                            singleBranch: true,
+                            ref: cmd.args[0],
+                            //depth: 1,
+                            emitter
+                        });
+                    }
+                } catch (e) {
+                    term.error(e.message || e);
+                } finally {
+                    term.resume();
+                }
+            },
+            checkout: async function (cmd) {
+                cmd.args.shift();
+                try {
+                    if (cmd.args.length) {
+                        term.pause();
+                        var dir = await gitroot(cwd);
+                        var branches = await git.listBranches({ dir });
+                        if (cmd.args[0] === '-b') {
+                            const ref = cmd.args[1]
+                            await git.branch({ dir, ref })
+                            await git_wrapper.checkout({ dir, ref });
+                            branch = await gitBranch({ cwd });
+                        } else {
+                            if (branches.includes(cmd.args[0])) {
+                                await git_wrapper.checkout({ dir, ref: cmd.args[0] });
+                                branch = await gitBranch({ cwd });
+                            } else {
+                                var filepath = cmd.args[0].replace(dir, '');
+                                await gitCheckoutFile({ dir, filepath, branch });
+                            }
+                        }
+                    } else {
+                        term.echo('to be implemented');
+                        /*
+                         * M       js/main.js
+                         * Your branch is up-to-date with 'origin/gh-pages'.
+                         */
+                    }
+                } catch (e) {
+                    term.error(e.message || e);
+                } finally {
+                    term.resume();
+                }
                 /* TODO:
                  *
                  * Switched to branch 'gh-pages'
@@ -511,33 +750,34 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                  *   (use "git push" to publish your local commits)
                  */
             },
-            push: async function(cmd) {
-                if (credentials.username && credentials.password) {
+            push: async function (cmd) {
+                if (true || credentials.username && credentials.password) {
                     term.pause();
-                    var emitter = new EventEmitter();
-                    emitter.on('message', (message) => {
-                        term.echo(message);
-                    });
+                    var emitter = messageEmitter();
                     try {
                         var dir = await gitroot(cwd);
-                        var url = await repoURL({fs, dir});
-                        var branches = await git.listBranches({fs, dir, remote: 'origin'});
+                        var url = await repoURL({ dir });
+                        var branches = await git.listBranches({ dir, remote: 'origin' });
                         var output = [`To ${url}`];
                         if (branches.includes(branch)) {
-                            var ref = await git.resolveRef({fs, dir, ref: `refs/remotes/origin/${branch}`});
-                            var HEAD = await git.resolveRef({fs, dir, ref: 'HEAD'});
+                            var ref = await git.resolveRef({ dir, ref: `refs/remotes/origin/${branch}` });
+                            var HEAD = await git.resolveRef({ dir, ref: 'HEAD' });
                             output.push(`   ${ref.substring(0, 7)}..${HEAD.substring(0, 7)} ${branch} -> ${branch}`);
                         } else {
                             output.push(` * [new branch]      ${branch} -> ${branch}`);
                         }
-                        await git.push({
-                            fs,
-                            dir,
-                            ref: branch,
-                            authUsername: credentials.username,
-                            authPassword: credentials.password,
-                            emitter
-                        });
+                        try {
+                            await git_wrapper.push({
+                                dir,
+                                corsProxy: 'https://jcubic.pl/proxy.php?',
+                                ref: branch,
+                                //authUsername: credentials.username,
+                                //authPassword: credentials.password,
+                                emitter
+                            });
+                        } catch (e) {
+                            console.log(e);
+                        }
                         term.echo(output.join('\n'));
                     } catch (e) {
                         term.error(e.message || e);
@@ -548,14 +788,13 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     term.error('You need to call `git login` to set username and password before push');
                 }
             },
-            commit: async function(cmd) {
+            commit: async function (cmd) {
                 cmd.args.shift();
                 term.pause();
                 try {
                     async function commit() {
-                        var head = await git.resolveRef({ fs, dir, ref: 'HEAD'});
+                        var head = await git.resolveRef({ dir, ref: 'HEAD' });
                         var commit = await git.commit({
-                            fs,
                             dir,
                             author: {
                                 email: credentials.email,
@@ -568,7 +807,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                                 return ` ${label} mode 100644 ${fielpath}`;
                             }).join('\n');
                         }
-                        var diffs = await gitCommitDiff({fs, dir, newSha: commit, oldSha: head});
+                        var diffs = await gitCommitDiff({ dir, newSha: commit, oldSha: head });
                         var stat = diffStat(Object.values(diffs).map(value => value.diff));
                         term.echo(`[master ${commit.substring(0, 7)}] ${message}\n${stat}`);
                         term.echo(mod('deleted', 'delete'));
@@ -577,7 +816,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     var dir = await gitroot(cwd);
                     var all = !!cmd.args.filter(arg => arg.match(/^-.*a/)).length;
                     if (all) {
-                        await gitAddAll({fs, dir, branch});
+                        await gitAddAll({ dir, branch });
                     }
                     var message = getOption(/-.*m$/, cmd.args);
                     var name = credentials.fullname || credentials.username;
@@ -591,8 +830,8 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                             '# with \'#\' will be ignored, and an empty message aborts the commit.',
                             '#'
                         ];
-                        var head = await getHEAD({dir});
-                        var remote = await getHEAD({dir, remote: true});
+                        var head = await getHEAD({ dir });
+                        var remote = await getHEAD({ dir, remote: true });
                         if (head === remote) {
                             file = file.concat([
                                 `# On branch ${branch}`,
@@ -600,14 +839,13 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                                 '#'
                             ]);
                         }
-                        var files = await getAllStats({fs, cwd, branch});
+                        var files = await getAllStats({ cwd, branch });
                         var staged = files.filter(([_, stat]) => ['modified', 'deleted', 'added'].includes(stat));
                         var not_staged = files.filter(([_, stat]) => ['*modified', '*deleted'].includes(stat));
                         var new_files = files.filter(([_, stat]) => stat === '*added');
-                        console.log({files, staged, not_staged, new_files});
                         var mapping = {
                             'added': 'new file'
-                        }
+                        };
                         const format = ([filepath, status]) => {
                             status = status.replace(/^\*/, '');
                             return '#   ' + padright(`${mapping[status] || status}:`, 12) + filepath;
@@ -629,10 +867,10 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         var editor = window.editor = vi(textarea[0], {
                             color: '#ccc',
                             backgroundColor: '#000',
-                            onSave: function() {
+                            onSave: function () {
                                 file = textarea.val().replace(/&amp;/g, '&').replace(/&lt;/g, '<').split('\n');
                             },
-                            onExit: async function() {
+                            onExit: async function () {
                                 message = file.filter(line => !line.startsWith('#')).join('\n').trim();
                                 if (!message) {
                                     term.echo('Aborting commit due to empty commit message.');
@@ -645,34 +883,42 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     } else {
                         await commit();
                     }
-                } catch(e) {
+                } catch (e) {
                     term.exception(e);
                     throw e;
                 } finally {
                     term.resume();
                 }
             },
-            add: function(cmd) {
+            add: function (cmd) {
                 term.pause();
                 cmd.args.shift();
                 var all_git = cmd.args.filter(arg => arg.match(/^(-A|-all)$/)).length;
                 var all = !!cmd.args.filter(arg => arg === '.').length;
                 if (all || all_git) {
                     gitroot(cwd).then(dir => {
-                        return gitAddAll({fs, dir, branch, all});
+                        return gitAddAll({ dir, branch, all });
                     }).then(term.resume).catch(error);
                 } else if (cmd.args.length > 0) {
-                    processGitFiles(cmd.args).then(({files, dir}) => {
-                        return Promise.all(files.map(filepath => git.add({fs, dir, filepath})));
+                    processGitFiles(cmd.args).then(({ files, dir }) => {
+                        return Promise.all(files.map(async filepath => {
+                            const status = await git.status({ dir, filepath });
+                            if (status.match(/^\*/)) {
+                                if (status === '*deleted') {
+                                    return git.remove({ dir, filepath });
+                                }
+                                await git.add({ dir, filepath });
+                            }
+                        }));
                     }).then(term.resume).catch(error);
                 } else {
                     term.resume();
                 }
             },
-            rm: function(cmd) {
+            rm: function (cmd) {
                 cmd.args.shift();
                 var long_options = cmd.args.filter(name => name.match(/^--/));
-                var {args, options} = split_args(cmd.args.filter(name => !name.match(/^--/)));
+                var { args, options } = split_args(cmd.args.filter(name => !name.match(/^--/)));
                 var len = args.length;
                 if (!len) {
                     term.error('Nothing to remove');
@@ -688,9 +934,9 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                                 } else if (stat) {
                                     var filepath = path_name.replace(re, '');
                                     if (stat.isDirectory()) {
-                                        var promise = git.listDir({fs, dir}).then((list) => {
+                                        var promise = git.listDir({ dir }).then((list) => {
                                             var files = list.filter(name => name.startsWith(filepath));
-                                            return Promise.all(files.map(file => git.remove({fs, dir, filepath})));
+                                            return Promise.all(files.map(file => git.remove({ dir, filepath })));
                                         }).catch(err => term.error(err));
                                         if (options.match(/r/)) {
                                             if (!long_options.includes(/--cached/)) {
@@ -701,9 +947,9 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                                         }
                                     } else if (stat.isFile()) {
                                         if (!long_options.includes(/--cached/)) {
-                                            git.remove({fs, dir, filepath}).then(() => fs.unlink(path_name));
+                                            git.remove({ dir, filepath }).then(() => fs.unlink(path_name));
                                         } else {
-                                            git.remove({fs, dir, filepath})
+                                            git.remove({ dir, filepath });
                                         }
                                     }
                                 } else {
@@ -717,15 +963,15 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     });
                 }
             },
-            login: function() {
+            login: function () {
                 var questions = [
-                    {name: 'username'},
-                    {name: 'password', mask: true},
-                    {name: 'fullname'},
-                    {name: 'email'}
-                ]
-                term.echo('This will not authenticate to test if login/password are correct,\n'+
-                          'only save credentials in localStorage (expect password) and use them when push/clone/commit');
+                    { name: 'username' },
+                    { name: 'password', mask: true },
+                    { name: 'fullname' },
+                    { name: 'email' }
+                ];
+                term.echo('This will not authenticate to test if login/password are correct,\n' +
+                    'only save credentials in localStorage (expect password) and use them when push/clone/commit');
                 var history = term.history();
                 history.disable();
                 (function loop() {
@@ -751,7 +997,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     }
                 })();
             },
-            status: function(cmd) {
+            status: function (cmd) {
                 var dir = cwd.split('/')[1];
                 term.pause();
                 /* TODO:
@@ -761,7 +1007,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                  *
                  * nothing to commit, working tree clean
                  */
-                getAllStats({fs, cwd, branch}).then((files) => {
+                getAllStats({ cwd, branch }).then((files) => {
                     function filter(files, name) {
                         if (name instanceof Array) {
                             return files.filter(([_, status]) => name.includes(status));
@@ -776,7 +1022,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     }
                     var changes = not(files, ['unmodified', 'ignored']);
                     if (!changes.length) {
-                        git.log({fs, dir, depth: 2, ref: branch}).then((commits) => {
+                        git.log({ dir, depth: 2, ref: branch }).then((commits) => {
                             term.echo(`On branch ${branch}`);
                             if (commits.length == 2) {
                                 term.echo('nothing to commit, working directory clean\n');
@@ -788,10 +1034,10 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         });
                     } else {
                         var label = {
-                            'deleted':  'deleted:    ',
-                            'added':    'new file:   ',
+                            'deleted': 'deleted:    ',
+                            'added': 'new file:   ',
                             'modified': 'modified:   ',
-                            'absent':   'deleted:    '
+                            'absent': 'deleted:    '
                         };
                         var padding = '        ';
                         var output = [`On branch ${branch}`];
@@ -839,11 +1085,11 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     }
                 }).catch(error);
             },
-            diff: function(cmd) {
+            diff: function (cmd) {
                 cmd.args.shift();
                 term.pause();
-                function diff({dir, filepath}) {
-                    return gitDiff({dir, filepath, branch}).then(diff => {
+                function diff({ dir, filepath }) {
+                    return gitDiff({ dir, filepath, branch }).then(diff => {
                         const text = diff.hunks.map(hunk => {
                             let output = [];
                             output.push(color(
@@ -866,7 +1112,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                                     color_name = line[0] == '-' ? 'red' : 'green';
                                 }
                                 if (color_name) {
-                                    return color(color_name, line);
+                                    return color(color_name, $.terminal.escape_brackets(line));
                                 } else {
                                     return line;
                                 }
@@ -887,15 +1133,20 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                 }
                 gitroot(cwd).then(dir => {
                     if (!cmd.args.length) {
-                        return git.listFiles({dir,fs}).then(files => {
+                        return git.listFiles({ dir }).then(files => {
                             return Promise.all(files.map((filepath) => {
-                                return git.status({fs, dir, filepath}).then(status => {
-                                    if (['unmodified', 'ignored'].includes(status)) {
-                                        return null;
-                                    } else {
-                                        return diff({dir, filepath});
-                                    }
-                                });
+                                try {
+                                    return git.status({ dir, filepath }).then(status => {
+                                        if (['unmodified', 'ignored'].includes(status)) {
+                                            return null;
+                                        } else {
+                                            return diff({ dir, filepath });
+                                        }
+                                    });
+                                } catch (e) {
+                                    debugger;
+                                    throw e;
+                                }
                             }));
                         }).then((diffs) => {
                             return diffs.filter(Boolean).reduce((acc, diff) => {
@@ -906,7 +1157,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     } else {
                         var re = new RegExp('^' + dir + '/?');
                         var filepath = fname.replace(re, '');
-                        return diff({dir, filepath}).then(({diff}) => diff).then(format);
+                        return diff({ dir, filepath }).then(({ diff }) => diff).then(format);
                     }
                 }).then(text => {
                     if (text.length - 1 > term.rows()) {
@@ -917,16 +1168,15 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     term.resume();
                 }).catch(err => term.error(err.message).resume());
             },
-            log: function(cmd) {
+            log: function (cmd) {
                 term.pause();
                 var depth = getOption('-n', cmd.args);
                 depth = depth ? +depth : undefined;
                 gitroot(cwd).then(dir => {
-                    return Promise.all([getHEAD({dir}), getHEAD({dir, remote: true})])
-                                  .then(([head, remote_head]) => ({ dir, head, remote_head }));
-                }).then(({dir, head, remote_head}) => {
+                    return Promise.all([getHEAD({ dir }), getHEAD({ dir, remote: true })])
+                        .then(([head, remote_head]) => ({ dir, head, remote_head }));
+                }).then(({ dir, head, remote_head }) => {
                     function format(commit) {
-                        console.log({head, remote_head, commit: commit.oid});
                         var output = [];
                         var suffix = '';
                         if (head === remote_head && head === commit.oid) {
@@ -956,7 +1206,7 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         output.push(`    ${commit.message}`);
                         return output.join('\n');
                     }
-                    return git.log({fs, dir, depth, ref: branch}).then(commits => {
+                    return git.log({ dir, depth, ref: branch }).then(commits => {
                         var text = commits.filter(commit => !commit.error).map(format).join('\n\n');
                         if (text.length - 1 > term.rows()) {
                             term.less(text);
@@ -967,14 +1217,14 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     });
                 }).catch(error);
             },
-            clone: function(cmd) {
+            clone: function (cmd) {
                 term.pause();
                 cmd.args.shift();
                 var args = [];
                 var options = {};
                 var long;
                 var re = /^--(.*)/;
-                cmd.args.forEach(function(arg) {
+                cmd.args.forEach(function (arg) {
                     if (long) {
                         options[long[1]] = arg;
                     } else if (!String(arg).match(re)) {
@@ -983,17 +1233,17 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     long = String(arg).match(re);
                 });
                 var depth = getOption(/^--depth/, cmd.args);
-                var url = 'https://jcubic.pl/proxy.php?' + args[0];
-                var re = /\/([^\/]+)(\.git)?$/;
-                var repo_dir = args.length === 2 ? args[1] : args[0].match(re)[1];
-                fs.stat('/' + repo_dir, function(err, stat) {
+                var url = args[0];
+                re = /\/([^\/]+?)(\.git)?$/;
+                var repo_dir = path.join(cwd, (args.length === 2 ? args[1] : args[0].match(re)[1]));
+                fs.stat(repo_dir, function (err, stat) {
                     if (err) {
-                        fs.mkdir(repo_dir, function(err) { if (!err) { clone() }});
+                        mkdir(repo_dir, true).then(clone).catch(error);
                     } else if (stat) {
                         if (stat.isFile()) {
                             term.error(`"${repo_dir}" is a file`).resume();
                         } else {
-                            fs.readdir('/' + repo_dir, function(err, list) {
+                            fs.readdir(repo_dir, function (err, list) {
                                 if (list.length) {
                                     term.error(`"${repo_dir}" exists and is not empty`).resume();
                                 } else {
@@ -1003,76 +1253,136 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                         }
                     }
                 });
-                var emitter = new EventEmitter();
-                var index = null;
-                emitter.on('message', (message) => {
-                    if (message.match(/Compressing/)) {
-                        if (index === null) {
-                            term.echo(message);
-                            index = term.last_index();
-                        } else {
-                            term.update(index, message)
-                        }
-                    } else {
-                        term.echo(message);
-                    }
-                });
                 function clone() {
                     term.echo(`Cloning into '${repo_dir}'...`);
-                    git.clone({
-                        fs: fs,
+                    var auth = {};
+                    if (credentials.username && credentials.password) {
+                        auth = {
+                            authUsername: credentials.username,
+                            authPassword: credentials.password
+                        };
+                    }
+                    git_wrapper.clone({
                         dir: repo_dir,
+                        corsProxy: 'https://jcubic.pl/proxy.php?',
                         url: url,
-                        depth: depth ? +depth : 2,
+                        ...auth,
+                        depth: depth ? +depth : undefined,
                         singleBranch: true,
-                        emitter: emitter
-                    }).then(() => {
-                        term.echo(`clone complete`).resume();
-                    }).catch(error);
+                        emitter: new messageEmitter()
+                    }).then(term.resume).catch(error);
                 }
             }
         },
-        credits: function() {
+        credits: function () {
             var lines = [
                 '',
                 'Projects used with GIT Web Terminal:',
                 '\t[[!;;;;https://isomorphic-git.github.io]isomorphic-git] v. ' + git.version() + ' by William Hilton',
                 '\t[[!;;;;https://github.com/jvilk/BrowserFS]BrowserFS] by John Vilk',
                 '\t[[!;;;;https://terminal.jcubic.pl]jQuery Terminal] v.' + $.terminal.version + ' by Jakub Jankiewicz',
-                '\t[[!;;;;https://github.com/timoxley/wcwidth]wcwidth] by Tim Oxley',
+                '\t[[!;;;;https://github.com/timoxley/wcwidth]wcwidth] by Jun Woong',
                 '\t[[!;;;;https://github.com/inexorabletash/polyfill]keyboard key polyfill] by Joshua Bell',
                 '\t[[!;;;;https://github.com/jcubic/jsvi]jsvi] originaly by Internet Connection, Inc. with changes from Jakub Jankiewicz',
                 '\t[[!;;;;https://github.com/Olical/EventEmitter/]EventEmitter] by Oliver Caldwell',
-                '\t[[!;;;;https://github.com/PrismJS/prism]PrimsJS] by Lea Verou',
+                '\t[[!;;;;https://github.com/PrismJS/prism]PrismJS] by Lea Verou',
                 '\t[[!;;;;https://github.com/kpdecker/jsdiff]jsdiff] by Kevin Decker',
                 '\t[[!;;;;https://github.com/softius/php-cross-domain-proxy]AJAX Cross Domain (PHP) Proxy] by Iacovos Constantinou',
+                '\t[[!;;;;https://github.com/jcubic/Clarity]Clarity icons] by Jakub Jankiewicz',
+                '\t[[!;;;;https://github.com/jcubic/jquery.splitter]jQuery Splitter] by Jakub Jankiewicz',
+                '\t[[!;;;;http://www.ymacs.org/]Ymacs] by Mihai Bazon & Dynarch.com',
+                '\t[[!;;;;http://stuk.github.io/jszip/]JSZip] by Stuart Knightley',
                 '',
                 'Contributors:'
             ].concat(contributors.map(user => '\t[[!;;;;' + user.url + ']' + (user.fullname || user.name) + ']'));
             term.echo(lines.join('\n') + '\n');
         },
-        help: function() {
-            term.echo('\nList of commands: ' + Object.keys(commands).join(', '));
-            term.echo('List of Git commands: ' + Object.keys(commands.git).join(', '));
+        help: function () {
+            term.echo('\nList of commands: ' + Object.keys(term.commands).join(', '), { keepWords: true });
+            term.echo('List of Git commands: ' + Object.keys(term.commands.git).join(', '), { keepWords: true });
             term.echo([
                 '',
-                'to use git you first need to clone the repo; it may take a while (depending on the size),',
-                'then you can made changes using [[;#fff;]vi], use [[;#fff;]git add] and then [[;#fff;]git commit].',
+                'to use git you first need to clone the repo (use --depth to speed up cloning of big repos),',
+                'then you can made changes using [[;#fff;]vi] or [[;#fff;]emacs], use [[;#fff;]git add] and then ' +
+                '[[;#fff;]git commit].',
+                '',
                 'Before you commit you need to use the command [[b;#fff;]git login] which will ask for credentials.',
                 'It will also ask for full name and email to be used in [[b;#fff;]git commit]. If you set the correct',
-                'username and password you can push to remote; if you type the wrong credentials you can call login again',
+                'username and password you can push to remote; if you\'ll type wrong credentials you can call login again.',
+                '',
+                'To view the files you can use [[;#fff;]view <file>] commands that will split terminal and open browser.',
+                'You can also open directories (it\'s just iframe with files served from browserfs using service worker).',
+                'If you have web app you can open it using file browser and [[;#fff;]view] command.',
+                '',
+                'You can use [[;#fff;]record start] to record commands in url hash so you can share commansds you\'ll type.',
                 ''
-            ].join('\n'));
+            ].join('\n'), { keepWords: true });
         }
     };
-    var ymacs_loading = true;
-    var ymacs_promise = init_ymacs();
-    ymacs_promise.then(() => ymacs_loading = false);
+    var ymacs = init_ymacs();
     var scrollTop;
-    var term = $('.term').terminal(function(command, term) {
-        var cmd = $.terminal.parse_command(command);
-        if (commands[cmd.name]) {
-            var action = commands[cmd.name];
+    var view = (function () {
+        var base = location.pathname.replace(/\/[^\/]+$/, '/').replace(/__browserfs__.*/, '');
+        var viewer = $('.viewer');
+        var iframe = viewer.find('iframe');
+        var splitter;
+        viewer.on('click', '.close', function () {
+            if (splitter) {
+                splitter.destroy();
+                splitter = null;
+                viewer.hide();
+                $('.terminal-view').css('width', '');
+            }
+        });
+        var adress = viewer.find('input').on('keydown', function (e) {
+            if (e.key.toLowerCase() == 'enter') {
+                view(adress.val());
+            }
+        });
+        viewer.on('click', '.refresh', function () {
+            view(adress.val());
+        });
+        var paths = [];
+        var index = 0;
+        var next = viewer.find('.next').on('click', function () {
+            if (!next.is('.disabled')) {
+                view(paths[++index], true);
+            }
+        });
+        var prev = viewer.find('.prev').on('click', function () {
+            if (!prev.is('.disabled')) {
+                view(paths[--index], true);
+            }
+        });
+
+        function view(path, soft) {
+            if (!splitter) {
+                splitter = $('.split').split({
+                    orientation: 'vertical',
+                    limit: 400
+                });
+            }
+            iframe.off('load').on('load', function () {
+                var path = iframe[0].contentWindow.location.href.replace(/.*__browserfs__/, '');
+                adress.val(path);
+                // this need to be added each time because we need to access soft prop
+                if (!soft) {
+                    paths = paths.slice(0, index + 1);
+                    paths.push(path);
+                    index = paths.length - 1;
+                }
+                soft = false;
+                next.toggleClass('disabled', index === paths.length - 1);
+                prev.toggleClass('disabled', index === 0);
+            }).attr('src', base + '__browserfs__' + resolve(path));
+        }
+
+        return view;
+    })();
+    var instance = $('.term').terminal(function (command, term) {
+        var cmd = $.terminal.split_command(command);
+        if (term.commands[cmd.name]) {
+            var action = term.commands[cmd.name];
             var args = cmd.args.slice();
             while (true) {
                 if (typeof action == 'object' && args.length) {
@@ -1086,24 +1396,19 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
             } else {
                 term.error('Unknown command');
             }
+        } else if (command) {
+            term.error('Unknown command');
         }
     }, {
         execHash: true,
-        // fix wierd jumping on windows/chrome
-        keydown: function() {
-            scrollTop = term.scrollTop();
-            term.prop({scrollTop: self.prop('scrollHeight')});
+        onResize: function () {
+            this.innerHeight(this.parent().height());
         },
-        keyup: function() {
-            if (typoef scrollTop !== 'undefined') {
-                setTimeout(() => term.scrollTop(scrollTop), 0);
-            }
-        },
-        completion: function(string, cb) {
+        completion: function (string, cb) {
             var cmd = $.terminal.parse_command(this.before_cursor());
             function processAssets(callback) {
                 var dir = get_path(string);
-                list('/' + dir.join('/')).then(callback);
+                return list('/' + dir.join('/')).then(callback);
             }
             function prepend(list) {
                 if (string.match(/\//)) {
@@ -1124,15 +1429,30 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     case 'vi':
                     case 'less':
                     case 'emacs':
-                        return processAssets(content => cb(prepend(trailing(content.dirs).concat(content.files))));
+                    case 'view':
+                        processAssets(content => cb(prepend(trailing(content.dirs).concat(content.files))));
+                        break;
                     // complete directories
                     case 'ls':
                     case 'cd':
-                        return processAssets(content => cb(prepend(trailing(content.dirs))));
+                        processAssets(content => cb(prepend(trailing(content.dirs))));
+                        break;
+                    default:
+                        if (term.completion[cmd.name]) {
+                            processAssets(content => {
+                                term.completion[cmd.name].call(
+                                    term,
+                                    string,
+                                    cb,
+                                    content.files,
+                                    prepend(trailing(content.dirs))
+                                );
+                            });
+                        }
                 }
             }
             if (cmd.args.length) {
-                var command = commands[cmd.name];
+                var command = term.commands[cmd.name];
                 if (command) {
                     var args = cmd.args.slice();
                     while (true) {
@@ -1147,12 +1467,12 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
                     }
                 }
             } else {
-                cb(Object.keys(commands));
+                cb(Object.keys(term.commands));
             }
         },
         greetings: false,
         name,
-        prompt: function(cb) {
+        prompt: function (cb) {
             var path = color('blue', cwd);
             var b = branch ? ' &#91;' + color('violet', branch) + '&#93;' : '';
             cb([
@@ -1164,243 +1484,148 @@ BrowserFS.configure({ fs: 'IndexedDB', options: {} }, function (err) {
             ].join(''));
         }
     }).echo(greetings);
+    term = $.extend(instance, term);
 });
 
 // ---------------------------------------------------------------------------------------------------------
 function init_ymacs() {
-    var root = 'https://rawgit.com/jcubic/leash/master/lib/apps/ymacs/';
-    function style(url) {
-        $('<link/>').attr({
-            href: url,
-            rel: 'stylesheet'
-        }).appendTo('head');
-    }
-    var files = [
-        'test/dl/js/thelib.js',
-        'src/js/ymacs.js',
-        'src/js/ymacs-keyboard.js',
-        'src/js/ymacs-regexp.js',
-        'src/js/ymacs-frame.js',
-        'src/js/ymacs-textprop.js',
-        'src/js/ymacs-exception.js',
-        'src/js/ymacs-interactive.js',
-        'src/js/ymacs-buffer.js',
-        'src/js/ymacs-marker.js',
-        'src/js/ymacs-commands.js',
-        'src/js/ymacs-commands-utils.js',
-        'src/js/ymacs-keymap.js',
-        'src/js/ymacs-keymap-emacs.js',
-        'src/js/ymacs-keymap-isearch.js',
-        'src/js/ymacs-minibuffer.js',
-        'src/js/ymacs-tokenizer.js',
-        'src/js/ymacs-mode-paren-match.js',
-        'src/js/ymacs-mode-lisp.js',
-        'src/js/ymacs-mode-js.js',
-        'src/js/ymacs-mode-xml.js',
-        'src/js/ymacs-mode-css.js',
-        'src/js/ymacs-mode-markdown.js',
-    ];
-    var promise = new Promise(function(resolve) {
-        (function loop() {
-            var file = files.shift();
-            if (!file) {
-                resolve();
-            } else {
-                $.getScript(root + file).then(loop);
-            }
-        })();
+    var ymacs = new Ymacs({
+        buffers: [],
+        className: "Ymacs-blinking-caret"
     });
-    style(root + 'test/dl/new-theme/default.css');
-    style(root + 'src/css/ymacs.css');
-    // -----------------------------------------------------------------------------------------------------
-    return promise.then(() => {
-        var ymacs = new Ymacs({
-            buffers: [ ],
-            className: "Ymacs-blinking-caret"
-        });
-        desktop = new DlDesktop({});
-        layout = new DlLayout({ parent: desktop });
-        ymacs.setColorTheme([ "dark", "y" ]);
-        ymacs.disabled(true);
-        layout.packWidget(ymacs, { pos: "bottom", fill: "*" });
-        try {
-            ymacs.getActiveBuffer().cmd("eval_file", ".ymacs");
-        } catch(ex) {}
-        // -------------------------------------------------------------------------------------------------
-        Ymacs.prototype.fs_setFileContents = function(name, content, stamp, cont) {
-            var self = this;
-            if (stamp) {
-                fs.readFile(name, function(err, file) {
-                    if (file != stamp) {
-                        cont(null);
-                    } else {
-                        self.fs_setFileContents(name, content, false, cont);
-                    }
-                });
+    ymacs.setColorTheme(["dark", "y"]);
+    ymacs.disabled(true);
+    var wrapper = $('.terminal-view').resizer(function () {
+        ymacs.callHooks('onResize');
+    });
+    $(ymacs.getElement()).appendTo(wrapper);
+    try {
+        ymacs.getActiveBuffer().cmd("eval_file", ".ymacs");
+    } catch (ex) { }
+    // -------------------------------------------------------------------------------------------------
+    Ymacs.prototype.fs_setFileContents = function (name, content, stamp, cont) {
+        var self = this;
+        if (stamp) {
+            fs.readFile(name, function (err, file) {
+                if (file != stamp) {
+                    cont(null);
+                } else {
+                    self.fs_setFileContents(name, content, false, cont);
+                }
+            });
+        } else {
+            fs.writeFile(name, content, function (err, written) {
+                if (!err) {
+                    cont(content);
+                } else {
+                    self.getActiveBuffer().signalInfo("Can't save file");
+                }
+            });
+        }
+    };
+    // -------------------------------------------------------------------------------------------------
+    Ymacs.prototype.fs_getFileContents = function (name, nothrow, cont) {
+        var self = this;
+        fs.stat(name, function (err, stat) {
+            if (err || !stat.isFile()) {
+                cont(null, null);
             } else {
-                fs.writeFile(name, content, function(err, written) {
-                    if (!err) {
-                        cont(content);
+                fs.readFile(name, function (err, file) {
+                    if (err) {
+                        if (!nothrow) {
+                            throw new Ymacs_Exception("File not found");
+                        } else {
+                            self.getActiveBuffer().signalInfo("Can't open file");
+                        }
                     } else {
-                        self.getActiveBuffer().signalInfo("Can't save file");
+                        cont(file.toString(), file.toString());
                     }
                 });
             }
-        };
-        // -------------------------------------------------------------------------------------------------
-        Ymacs.prototype.fs_getFileContents = function(name, nothrow, cont) {
-            var self = this;
-            console.log(name);
-            fs.stat(name, function(err, stat) {
-                if (err || !stat.isFile()) {
-                    cont(null, null);
+        });
+    };
+    // -------------------------------------------------------------------------------------------------
+    Ymacs.prototype.fs_fileType = function (name, cont) {
+        fs.stat(name, function (err, stat) {
+            cont(err || stat.isFile() ? true : null);
+        });
+    };
+    // -------------------------------------------------------------------------------------------------
+    Ymacs.prototype.fs_normalizePath = function (path) {
+        return path;
+    };
+    // -------------------------------------------------------------------------------------------------
+    Ymacs.prototype.fs_getDirectory = function (dir, cont) {
+        fs.readdir(dir, function (err, list) {
+            var result = {};
+            (function loop() {
+                var obj = list.shift();
+                if (!obj) {
+                    cont(result);
                 } else {
-                    fs.readFile(name, function(err, file) {
-                        if (err) {
-                            if (!nothrow) {
-                                throw new Ymacs_Exception("File not found");
-                            } else {
-                                self.getActiveBuffer().signalInfo("Can't open file");
-                            }
-                        } else {
-                            cont(file.toString(), file.toString());
+                    fs.stat(dir + '/' + obj, function (err, stat) {
+                        if (!err) {
+                            result[obj] = { type: stat.isFile() ? 'file' : 'directory' }
+                            loop();
                         }
                     });
                 }
-            });
-        };
-        // -------------------------------------------------------------------------------------------------
-        Ymacs.prototype.fs_fileType = function(name, cont) {
-            fs.stat(name, function(err, stat) {
-                cont(err || stat.isFile() ? true : null);
-            });
-        };
-        // -------------------------------------------------------------------------------------------------
-        Ymacs.prototype.fs_normalizePath = function(path) {
-            return path;
-        };
-        // -------------------------------------------------------------------------------------------------
-        Ymacs.prototype.fs_getDirectory = function(dir, cont) {
-            fs.readdir(dir, function(err, list) {
-                var result = {};
-                (function loop() {
-                    var obj = list.shift();
-                    if (!obj) {
-                        cont(result);
-                    } else {
-                        fs.stat(dir + '/' + obj, function(err, stat) {
-                            if (!err) {
-                                result[obj] = {type: stat.isFile() ? 'file' : 'directory'}
-                                loop();
-                            }
-                        });
+            })();
+        });
+    };
+    // -------------------------------------------------------------------------------------------------
+    Ymacs_Buffer.newCommands({
+        exit: Ymacs_Interactive(function () {
+            var buffs = ymacs.buffers.slice();
+            (function loop() {
+                var buff = buffs.shift();
+                if (buff.length > 1) {
+                    function next() {
+                        ymacs.killBuffer(buff);
+                        loop();
                     }
-                })();
-            });
-        };
-        // -------------------------------------------------------------------------------------------------
-        Ymacs_Buffer.newCommands({
-            exit: Ymacs_Interactive(function() {
-                var buffs = ymacs.buffers.slice();
-                (function loop() {
-                    var buff = buffs.shift();
-                    if (buff.length > 1) {
-                        function next() {
-                            ymacs.killBuffer(buff);
-                            loop();
+                    if (buff.name != '*scratch*') {
+                        if (buff.dirty()) {
+                            var msg = 'Save file ' + buff.name + ' yes or no?';
+                            buff.cmd('minibuffer_yn', msg, function (yes) {
+                                if (yes) {
+                                    buff.cmd('save_buffer_with_continuation',
+                                        false,
+                                        next);
+                                } else {
+                                    next();
+                                }
+                            });
+                        } else {
+                            next();
                         }
-                        if (buff.name != '*scratch*') {
-                            if (buff.dirty()) {
-                                var msg = 'Save file ' + buff.name + ' yes or no?';
-                                buff.cmd('minibuffer_yn', msg, function(yes) {
-                                    if (yes) {
-                                        buff.cmd('save_buffer_with_continuation',
-                                                 false,
-                                                 next);
-                                    } else {
-                                        next();
-                                    }
-                                });
-                            } else {
-                                next();
-                            }
-                        }
-                    } else {
-                        $('.DlDesktop').hide();
-                        ymacs.disabled(true);
-                        $.terminal.active().focus();
                     }
-                })();
-            }),
-            next_buffer: Ymacs_Interactive(function() {
-                var buffs = ymacs.buffers.slice();
-                var buff = ymacs.getActiveBuffer();
-                while(buffs.shift() != buff) {}
-                if (buffs.length) {
-                    ymacs.switchToBuffer(buffs[0]);
                 } else {
-                    ymacs.switchToBuffer(ymacs.buffers[0]);
+                    $('.DlDesktop, .DlLayout, .Ymacs').hide();
+                    ymacs.disabled(true);
+                    $.terminal.active().focus();
                 }
-            })
-        });
-        // -------------------------------------------------------------------------------------------------
-        DEFINE_SINGLETON("Ymacs_Keymap_Leash", Ymacs_Keymap_Emacs, function(D, P) {
-            D.KEYS = {
-                "C-x C-c": "exit"
-            };
-        });
-        return ymacs;
+            })();
+        }),
+        next_buffer: Ymacs_Interactive(function () {
+            var buffs = ymacs.buffers.slice();
+            var buff = ymacs.getActiveBuffer();
+            while (buffs.shift() != buff) { }
+            if (buffs.length) {
+                ymacs.switchToBuffer(buffs[0]);
+            } else {
+                ymacs.switchToBuffer(ymacs.buffers[0]);
+            }
+        })
     });
-}
-// ---------------------------------------------------------------------------------------------------------
-// prism overwrite to produce terminal formatting instead of html
-(function(Token) {
-    var _ = Prism;
-    _.Token = function(type, content, alias, matchedStr, greedy) {
-        Token.apply(this, [].slice.call(arguments));
-    };
-    _.Token.stringify = function(o, language, parent) {
-        if (typeof o == 'string') {
-            return o;
-        }
-
-        if (_.util.type(o) === 'Array') {
-            return o.map(function(element) {
-                return _.Token.stringify(element, language, o);
-            }).join('');
-        }
-
-        var env = {
-            type: o.type,
-            content: _.Token.stringify(o.content, language, parent),
-            tag: 'span',
-            classes: ['token', o.type],
-            attributes: {},
-            language: language,
-            parent: parent
+    // -------------------------------------------------------------------------------------------------
+    DEFINE_SINGLETON("Ymacs_Keymap_Leash", Ymacs_Keymap_Emacs, function (D, P) {
+        D.KEYS = {
+            "C-x C-c": "exit"
         };
-
-        if (env.type == 'comment') {
-            env.attributes['spellcheck'] = 'true';
-        }
-
-        if (o.alias) {
-            var aliases = _.util.type(o.alias) === 'Array' ? o.alias : [o.alias];
-            Array.prototype.push.apply(env.classes, aliases);
-        }
-
-        _.hooks.run('wrap', env);
-
-        var attributes = Object.keys(env.attributes).map(function(name) {
-            return name + '="' + (env.attributes[name] || '').replace(/"/g, '&quot;') + '"';
-        }).join(' ');
-
-        return env.content.split(/\n/).map(function(content) {
-            return '[[b;;;' + env.classes.join(' ') + ']' + content + ']';
-        }).join('\n');
-
-    };
-})(Prism.Token);
+    });
+    return ymacs;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 function time() {
@@ -1409,9 +1634,37 @@ function time() {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+async function listAllFiles({ dir, pathname = '', pattern = null }) {
+    let files = [];
+    var root = pathname ? path.join(dir, pathname) : dir;
+    let content = await listDir(root);
+    function skip(name) {
+        return pattern !== null && !name.match(pattern);
+    }
+    for (let filename of content.files) {
+        if (pathname) {
+            filename = path.join(pathname, filename);
+        }
+        if (skip(filename)) {
+            continue;
+        }
+        files.push(filename);
+    }
+    for (let dirname of content.dirs) {
+        if (pathname) {
+            dirname = path.join(pathname, dirname);
+        }
+        if (skip(dirname + '/')) {
+            continue;
+        }
+        files = files.concat(await listAllFiles({ dir, pathname: dirname, pattern }));
+    }
+    return files;
+}
+// ---------------------------------------------------------------------------------------------------------
 function listDir(path) {
-    return new Promise(function(resolve, reject) {
-        fs.readdir(path, function(err, dirList) {
+    return new Promise(function (resolve, reject) {
+        fs.readdir(path, function (err, dirList) {
             if (err) {
                 return reject(err);
             }
@@ -1423,10 +1676,12 @@ function listDir(path) {
             if (!len) {
                 resolve(result);
             }
-            dirList.forEach(function(filename) {
+            dirList.forEach(function (filename) {
                 var file = (path === '/' ? '' : path) + '/' + filename;
-
-                fs.stat(file, function(err, stat) {
+                fs.stat(file, function (err, stat) {
+                    if (err) {
+                        throw new Error(err);
+                    }
                     if (stat) {
                         result[stat.isFile() ? 'files' : 'dirs'].push(filename);
                     }
@@ -1443,37 +1698,37 @@ function listDir(path) {
 // ---------------------------------------------------------------------------------------------------------
 // source: https://stackoverflow.com/a/3629861/387194
 function union(x, y) {
-  var obj = {};
-  for (var i = x.length-1; i >= 0; -- i)
-     obj[x[i]] = x[i];
-  for (var i = y.length-1; i >= 0; -- i)
-     obj[y[i]] = y[i];
-  var res = []
-  for (var k in obj) {
-    if (obj.hasOwnProperty(k))  // <-- optional
-      res.push(obj[k]);
-  }
-  return res;
+    var obj = {};
+    for (var i = x.length - 1; i >= 0; --i)
+        obj[x[i]] = x[i];
+    for (var i = y.length - 1; i >= 0; --i)
+        obj[y[i]] = y[i];
+    var res = [];
+    for (var k in obj) {
+        if (obj.hasOwnProperty(k))  // <-- optional
+            res.push(obj[k]);
+    }
+    return res;
 }
 
 // ---------------------------------------------------------------------------------------------------------
 function intersection(a, b) {
-    return a.filter(function(n) {
+    return a.filter(function (n) {
         return b.includes(n);
     });
 }
 
 // ---------------------------------------------------------------------------------------------------------
 async function rmdir(dir) {
-    return new Promise(function(resolve, reject) {
-        fs.readdir(dir, async function(err, list) {
+    return new Promise(function (resolve, reject) {
+        fs.readdir(dir, async function (err, list) {
             if (err) {
                 return reject(err);
             }
-            for(var i = 0; i < list.length; i++) {
+            for (var i = 0; i < list.length; i++) {
                 var filename = path.join(dir, list[i]);
-                var stat = await new Promise(function(resolve, reject) {
-                    fs.stat(filename, function(err, stat) {
+                var stat = await new Promise(function (resolve, reject) {
+                    fs.stat(filename, function (err, stat) {
                         if (err) {
                             return reject(err);
                         }
@@ -1481,11 +1736,11 @@ async function rmdir(dir) {
                     });
                 });
                 if (!filename.match(/^\.{1,2}$/)) {
-                    if(stat.isDirectory()) {
+                    if (stat.isDirectory()) {
                         await rmdir(filename);
                     } else {
-                        await new Promise(function(resolve, reject) {
-                            fs.unlink(filename, function(err) {
+                        await new Promise(function (resolve, reject) {
+                            fs.unlink(filename, function (err) {
                                 if (err) {
                                     return reject(err);
                                 }
@@ -1503,26 +1758,24 @@ async function rmdir(dir) {
 
 
 // ---------------------------------------------------------------------------------------------------------
-async function listBranchFiles({fs, dir, branch}) {
-    const repo = { fs, dir };
-    const sha = await git.resolveRef({ ...repo, ref: `refs/remotes/origin/${branch}` });
-    const { object: { tree } } = await git.readObject({ ...repo, oid: sha });
+async function listBranchFiles({ dir, branch }) {
+    const sha = await git.resolveRef({ dir, ref: `refs/remotes/origin/${branch}` });
+    const { object: { tree } } = await git.readObject({ dir, oid: sha });
     var list = [];
-    return traverseCommit({fs, dir, sha, callback: ({filepath}) => list.push(filepath)}).then(() => list);
+    return traverseCommit({ dir, sha, callback: ({ filepath }) => list.push(filepath) }).then(() => list);
 }
 // ---------------------------------------------------------------------------------------------------------
-async function traverseCommit({fs, dir, sha, callback = $.noop}) {
-    const repo = {fs, dir};
-    const { object: { tree } } = await git.readObject({ ...repo, oid: sha });
+async function traverseCommit({ dir, sha, callback = $.noop }) {
+    const { object: { tree } } = await git.readObject({ dir, oid: sha });
     return await (async function readFiles(oid, path) {
-        const { object: { entries } } = await git.readObject({ ...repo, oid});
+        const { object: { entries } } = await git.readObject({ dir, oid });
         var i = 0;
         return (async function loop() {
             var entry = entries[i++];
             if (entry) {
                 if (entry.type == 'blob') {
                     var filepath = path.concat(entry.path).join('/');
-                    await callback({entry, filepath, oid: entry.oid});
+                    await callback({ entry, filepath, oid: entry.oid });
                 } else if (entry.type == 'tree' && entry.path !== '.git') {
                     await readFiles(entry.oid, path.concat(entry.path));
                 }
@@ -1533,21 +1786,21 @@ async function traverseCommit({fs, dir, sha, callback = $.noop}) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-async function gitCommitDiff({fs, dir, newSha, oldSha}) {
+async function gitCommitDiff({ dir, newSha, oldSha }) {
     var result = {};
     function reader(name) {
-        return async ({filepath, oid}) => {
+        return async ({ filepath, oid }) => {
             try {
-                const { object: pkg } = await git.readObject({ fs, dir, oid });
+                const { object: pkg } = await git.readObject({ dir, oid });
                 result[filepath] = result[filepath] || {};
                 result[filepath][name] = pkg.toString('utf8');
-            } catch(e) {
+            } catch (e) {
                 // ignore missing file/object
             }
         };
     }
-    await traverseCommit({fs, dir, sha: oldSha, callback: reader('oldFile')});
-    await traverseCommit({fs, dir, sha: newSha, callback: reader('newFile')});
+    await traverseCommit({ dir, sha: oldSha, callback: reader('oldFile') });
+    await traverseCommit({ dir, sha: newSha, callback: reader('newFile') });
     Object.keys(result).forEach(key => {
         var diff = JsDiff.structuredPatch(key, key, result[key].oldFile || '', result[key].newFile || '');
         if (typeof result[key].oldFile === 'undefined') {
@@ -1566,8 +1819,8 @@ async function gitCommitDiff({fs, dir, newSha, oldSha}) {
 
 // ---------------------------------------------------------------------------------------------------------
 function diffStat(diffs) {
-    var modifications = diffs.reduce((acc, {hunks}) => {
-        hunks.forEach(function(hunk) {
+    var modifications = diffs.reduce((acc, { hunks }) => {
+        hunks.forEach(function (hunk) {
             hunk.lines.forEach((line) => {
                 if (line[0] === '-') {
                     acc.minus++;
@@ -1577,35 +1830,37 @@ function diffStat(diffs) {
             });
         });
         return acc;
-    }, {plus: 0, minus: 0});
+    }, { plus: 0, minus: 0 });
     const plural = n => n == 1 ? '' : 's';
     var stat = [' ' + diffs.length + ' file' + plural(diffs.length)];
     if (modifications.plus) {
         stat.push(`${modifications.plus} insertion${plural(modifications.plus)}(+)`);
     }
     if (modifications.minus) {
-        stat.push(`${modifications.minus} insertion${plural(modifications.minus)}(-)`);
+        stat.push(`${modifications.minus} deletion${plural(modifications.minus)}(-)`);
     }
     return stat.join(', ');
 }
 
 // ---------------------------------------------------------------------------------------------------------
-async function readBranchFile({ dir, fs, filepath, branch }) {
+async function readBranchFile({ dir, filepath, branch }) {
     const ref = 'refs/remotes/origin/' + branch;
-    const sha = await git.resolveRef({ fs, dir,  ref });
-    const { object: { tree } } = await git.readObject({ fs, dir, oid: sha });
+    const sha = await git.resolveRef({ dir, ref });
+    const { object: { tree } } = await git.readObject({ dir, oid: sha });
     return (async function loop(tree, path) {
         if (!path.length) {
             throw new Error(`File ${filepath} not found`);
         }
         var name = path.shift();
-        const { object: { entries } } = await git.readObject({ fs, dir, oid: tree });
-        const packageEntry = entries.find((entry) => entry.path === name);
+        const { object: { entries } } = await git.readObject({ dir, oid: tree });
+        const packageEntry = entries.find((entry) => {
+            return entry.path === name;
+        });
         if (!packageEntry) {
             throw new Error(`File ${filepath} not found`);
         } else {
             if (packageEntry.type == 'blob') {
-                const { object: pkg } = await git.readObject({ fs, dir, oid: packageEntry.oid })
+                const { object: pkg } = await git.readObject({ dir, oid: packageEntry.oid });
                 return pkg.toString('utf8');
             } else if (packageEntry.type == 'tree') {
                 return loop(packageEntry.oid, path);
@@ -1632,33 +1887,51 @@ function date(timestamp, timezoneOffset) {
         return (offset > 1 ? '+' : '-') + timezone;
     }
     return [day, month, pad(d.getDate()),
-            [pad(d.getHours()), pad(d.getMinutes()), pad(d.getSeconds())].join(':'),
-            d.getFullYear(),
-            offset(timezoneOffset)
+        [pad(d.getHours()), pad(d.getMinutes()), pad(d.getSeconds())].join(':'),
+        d.getFullYear(),
+        offset(timezoneOffset)
     ].join(' ');
 }
 
 // ---------------------------------------------------------------------------------------------------------
 function gitroot(cwd) {
-    return git.findRoot({fs, filepath: cwd});
+    return git.findRoot({ filepath: cwd });
 }
 // ---------------------------------------------------------------------------------------------------------
-async function gitBranch({fs, cwd}) {
+async function gitBranch({ cwd }) {
     try {
         var dir = await gitroot(cwd);
-        return git.currentBranch({fs, dir});
-    } catch(e) {
+        return git.currentBranch({ dir });
+    } catch (e) {
     }
 }
 // ---------------------------------------------------------------------------------------------------------
-function gitDiff({dir, filepath, branch}) {
+function gitCheckoutFile({ dir, filepath, branch }) {
     var fname = dir + '/' + filepath;
-    return new Promise(function(resolve, reject) {
-        fs.readFile(fname, async function(err, newFile) {
+    return new Promise(function (resolve, reject) {
+        readBranchFile({ dir, branch, filepath }).then(oldFile => {
+            if (!oldFile) {
+                return;
+            }
+            fs.writeFile(fname, oldFile, err => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            });
+        });
+    });
+}
+// ---------------------------------------------------------------------------------------------------------
+function gitDiff({ dir, filepath, branch }) {
+    var fname = dir + '/' + filepath;
+    return new Promise(function (resolve, reject) {
+        fs.readFile(fname, async function (err, newFile) {
             if (!err) {
                 newFile = newFile.toString();
             }
-            readBranchFile({fs, dir, branch, filepath}).then(oldFile => {
+            readBranchFile({ dir, branch, filepath }).then(oldFile => {
                 const diff = JsDiff.structuredPatch(filepath, filepath, oldFile || '', newFile || '');
                 resolve(diff);
             }).catch(err => reject(err));
@@ -1666,12 +1939,12 @@ function gitDiff({dir, filepath, branch}) {
     });
 }
 // ---------------------------------------------------------------------------------------------------------
-async function gitReset({fs, dir, ref, branch, hard = false}) {
-    var re = /^HEAD~([0-9]+)$/
+async function gitReset({ git, dir, ref, branch, hard = false }) {
+    var re = /^HEAD~([0-9]+)$/;
     var m = ref.match(re);
     if (m) {
         var count = +m[1];
-        var commits = await git.log({fs, dir, depth: count + 1});
+        var commits = await git.log({ dir, depth: count + 1 });
         return new Promise((resolve, reject) => {
             if (commits.length < count + 1) {
                 return reject('Not enough commits');
@@ -1690,7 +1963,7 @@ async function gitReset({fs, dir, ref, branch, hard = false}) {
                             return reject(err);
                         }
                         // checkout the branch into the working tree
-                        git.checkout({ dir, fs, ref: branch }).then(resolve);
+                        git.checkout({ dir, ref: branch }).then(resolve);
                     });
                 }
             });
@@ -1698,26 +1971,29 @@ async function gitReset({fs, dir, ref, branch, hard = false}) {
     }
     return Promise.reject(`Wrong ref ${ref}`);
 }
+
 // ---------------------------------------------------------------------------------------------------------
-function gitURL({fs, dir, gitdir = path.join(dir, '.git'), remote = 'origin'}) {
-    return git.config({fs, gitdir, path: `remote.${remote}.url`});
+function gitURL({ dir, gitdir = path.join(dir, '.git'), remote = 'origin' }) {
+    return git.config({ gitdir, path: `remote.${remote}.url` });
 }
+
 // ---------------------------------------------------------------------------------------------------------
-async function repoURL({fs, dir, gitdir = path.join(dir, '.git'), remote = 'origin'}) {
-    var url = await gitURL({fs, dir, gitdir, remote});
+async function repoURL({ dir, gitdir = path.join(dir, '.git'), remote = 'origin' }) {
+    var url = await gitURL({ dir, gitdir, remote });
     return url.replace(/^https:\/\/jcubic.pl\/proxy.php\?/, '');
 }
+
 // ---------------------------------------------------------------------------------------------------------
-function getHEAD({dir, gitdir, remote = false}) {
+function getHEAD({ dir, gitdir, remote = false }) {
     if (!remote) {
-        return git.resolveRef({fs, dir, ref: 'HEAD'});
+        return git.resolveRef({ dir, ref: 'HEAD' });
     } else {
-        //return git.resolveRef({fs, dir: 'test', ref: 'refs/remotes/origin/HEAD'});
+        //return git.resolveRef({dir: 'test', ref: 'refs/remotes/origin/HEAD'});
     }
     return new Promise((resolve, reject) => {
         var base = `${dir}/${gitdir || '.git'}/`;
         var ref_file = remote ? `${base}refs/remotes/origin/HEAD` : `${base}HEAD`;
-        fs.readFile(ref_file, function(err, data) {
+        fs.readFile(ref_file, function (err, data) {
             var ref;
             if (err) {
                 //return reject(`can't read ${ref_file}: ${err}` );
@@ -1725,12 +2001,158 @@ function getHEAD({dir, gitdir, remote = false}) {
             } else {
                 ref = data.toString().match(/ref: (.*)/)[1];
             }
-            fs.readFile(base + ref, function(err, data) {
+            fs.readFile(base + ref, function (err, data) {
                 if (err) {
                     return reject(`can't read ${base + ref}: ${err}`);
                 }
                 resolve(data.toString().trim());
             });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+function mkdir(dir, parent = false) {
+    return new Promise(function (resolve, reject) {
+        if (parent) {
+            dir = dir.split('/');
+            if (!dir.length) {
+                return reject('Invalid argument');
+            }
+            var full_path = '/';
+            (function loop() {
+                if (!dir.length) {
+                    return resolve();
+                }
+                full_path = path.join(full_path, dir.shift());
+                fs.stat(full_path, function (err, stat) {
+                    if (err) {
+                        fs.mkdir(full_path, function (err) {
+                            if (err) {
+                                reject(err);
+                            } else {
+                                loop();
+                            }
+                        });
+                    } else if (stat) {
+                        if (stat.isDirectory()) {
+                            loop();
+                        } else if (stat.isFile()) {
+                            reject(`${full_path} is a file`);
+                        }
+                    }
+                });
+            })();
+        } else {
+            fs.stat(dir, function (err, stat) {
+                if (err) {
+                    fs.mkdir(dir, function (err) {
+                        if (err) {
+                            reject(err);
+                        } else {
+                            resolve();
+                        }
+                    });
+                } else if (stat) {
+                    if (stat.isDirectory()) {
+                        reject('Directory already exists');
+                    } else if (stat.isFile()) {
+                        reject(`${dir} is a File`);
+                    }
+                }
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+async function makeZip(dir, filepath) {
+    dir = dir.replace(/\/?$/, '/');
+    var zip = new JSZip();
+    var directories = {};
+    var re = new RegExp('^' + dir);
+    await traverseDirectory(dir, async function (stat, filepath) {
+        var relPath = filepath.replace(re, '').replace(/^\//, '');
+        if (stat == 'directory') {
+            if (filepath !== dir) {
+                directories[relPath] = zip.folder(relPath);
+            }
+        } else if (stat == 'file') {
+            var parts = relPath.split('/');
+            var filename = parts.pop();
+            var dir = parts.join('/');
+            await new Promise(function (resolve, reject) {
+                fs.readFile(filepath, function (err, data) {
+                    if (err) {
+                        return reject(err);
+                    }
+                    var blob = new Blob([data], {
+                        type: "text/plain"
+                    });
+                    (directories[dir] || zip).file(filename, data);
+                    resolve();
+                });
+            });
+        }
+    }, { parentFirst: true });
+    return writeZip(zip, filepath);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+function writeZip(zip, filepath) {
+    return new Promise(function (resolve, reject) {
+        zip.generateAsync({ type: "blob" }).then(function (blob) {
+            var fileReader = new FileReader();
+            fileReader.onload = function () {
+                var arrayBuffer = this.result;
+                fs.writeFile(filepath, new buffer.Buffer(arrayBuffer), function (err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                });
+            };
+            fileReader.readAsArrayBuffer(blob);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+function traverseDirectory(dir, callback, options) {
+    var settings = Object.assign({}, {
+        parentFirst: false
+    }, options);
+    return new Promise(function (resolve, reject) {
+        fs.readdir(dir, async function (err, list) {
+            if (err) {
+                return reject(err);
+            }
+            if (settings.parentFirst) {
+                await callback('directory', dir);
+            }
+            for (var i = 0; i < list.length; i++) {
+                var filename = path.join(dir, list[i]);
+                var stat = await new Promise(function (resolve, reject) {
+                    fs.stat(filename, function (err, stat) {
+                        if (err) {
+                            return reject(err);
+                        }
+                        resolve(stat);
+                    });
+                });
+                if (!filename.match(/^\.{1,2}$/)) {
+                    if (stat.isDirectory()) {
+                        await traverseDirectory(filename, callback, options);
+                    } else {
+                        await callback('file', filename);
+                    }
+                }
+            }
+            if (!settings.parentFirst) {
+                await callback('directory', dir);
+            }
+            resolve();
         });
     });
 }
