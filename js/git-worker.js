@@ -1,8 +1,8 @@
 /* global importScripts, self, BrowserFS, git, EventEmitter */
 window = self;
 importScripts(
-    "https://cdn.jsdelivr.net/npm/isomorphic-git@0.x.x/dist/bundle.umd.min.js",
-    // '../../../iso-git-latest/dist/bundle.umd.min.js',
+    "https://unpkg.com/isomorphic-git@1.11.0/index.umd.min.js",
+    "https://unpkg.com/isomorphic-git@1.11.0/http/web/index.umd.js",
     "https://cdn.jsdelivr.net/npm/browserfs@1.x.x",
     "https://cdn.jsdelivr.net/npm/wolfy87-eventemitter@5.2.5/EventEmitter.js"
 );
@@ -38,7 +38,7 @@ function wrap(name, names) {
 const term = wrap('terminal', ['read', 'set_mask', 'confirm', 'resume', 'pause', 'paused']);
 
 const CredentialManager = {
-    async fill({ url }) {
+    async fill(url) {
         let paused = await term.paused();
         if (paused) await term.resume();
         let auth = await localStorage.getItem(url);
@@ -53,7 +53,7 @@ const CredentialManager = {
             password
         };
     },
-    async approved({ url, auth }) {
+    async approved(url, auth) {
         let savedAuth = await localStorage.getItem(url);
         if (savedAuth) {
             savedAuth = JSON.parse(savedAuth);
@@ -71,7 +71,7 @@ const CredentialManager = {
         }
         if (paused) await term.pause();
     },
-    async rejected({ url, auth }) {
+    async rejected(url, auth) {
         if (await localStorage.getItem(url)) {
             let paused = await term.paused();
             if (paused) await term.resume();
@@ -90,8 +90,8 @@ self.addEventListener('message', ({ data }) => {
         fs: 'IndexedDB', options: {}
     }, function (err) {
         self.fs = BrowserFS.BFSRequire('fs');
-        git.plugins.set('fs', self.fs);
-        git.plugins.set('credentialManager', CredentialManager);
+        // git.plugins.set('fs', self.fs);
+        // git.plugins.set('credentialManager', CredentialManager);
         let id = data.id;
         if (data.type !== 'RPC' || id === null) {
             return;
@@ -102,7 +102,25 @@ self.addEventListener('message', ({ data }) => {
                 data.params.emitter.on('message', (message) => {
                     self.postMessage({ type: 'EMITTER', id, message });
                 });
+                data.params.fs = self.fs
+
+                data.params.onAuth = async (url) => {
+                    const username = 'CharlieLau'
+                    // 密码是 token
+                    const password = 'TODO: github  token'
+                    return {
+                        username,
+                        password
+                    }
+                }
+                // data.params.onAuthSuccess = CredentialManager.approved
+                data.params.onAuthFailure = (...args) => {
+                    console.log('211', args)
+                }
+                data.params.http = self.GitHttp
             }
+
+
             git[data.method].call(git, data.params).then(result => {
                 self.postMessage({ type: 'RPC', id, result });
             }).catch((err) => {

@@ -769,11 +769,9 @@ BrowserFSConfigure().then(() => {
                         try {
                             await git_wrapper.push({
                                 dir,
-                                corsProxy: 'https://jcubic.pl/proxy.php?',
+                                corsProxy: 'http://localhost:9889',
                                 ref: branch,
-                                //authUsername: credentials.username,
-                                //authPassword: credentials.password,
-                                emitter
+                                emitter,
                             });
                         } catch (e) {
                             console.log(e);
@@ -1264,7 +1262,7 @@ BrowserFSConfigure().then(() => {
                     }
                     git_wrapper.clone({
                         dir: repo_dir,
-                        corsProxy: 'https://jcubic.pl/proxy.php?',
+                        corsProxy: 'http://localhost:9889',
                         url: url,
                         ...auth,
                         depth: depth ? +depth : undefined,
@@ -1980,7 +1978,7 @@ function gitURL({ dir, gitdir = path.join(dir, '.git'), remote = 'origin' }) {
 // ---------------------------------------------------------------------------------------------------------
 async function repoURL({ dir, gitdir = path.join(dir, '.git'), remote = 'origin' }) {
     var url = await gitURL({ dir, gitdir, remote });
-    return url.replace(/^https:\/\/jcubic.pl\/proxy.php\?/, '');
+    return url.replace(/^http:\/\/localhost:3000/, '');
 }
 
 // ---------------------------------------------------------------------------------------------------------
